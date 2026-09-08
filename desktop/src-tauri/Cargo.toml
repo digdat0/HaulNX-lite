@@ -1,0 +1,75 @@
+[package]
+name = "haulnx-app-utility"
+version = "2.2.43"
+description = "HaulNX App Utility — Windows desktop companion"
+authors = ["digdat0"]
+edition = "2021"
+rust-version = "1.77"
+# Kept in lockstep with tauri.conf.json's version — app_info() reports this
+# (CARGO_PKG_VERSION) and self_update_check compares releases against it.
+
+# HAULNX_LITE (see the NRO's Makefile) removes the ROM-acquisition/downloader
+# feature entirely for app-store submissions that reject any "download a ROM
+# from the internet" capability. The `lite` feature is this app's equivalent:
+# app_info() reports it, download_file() refuses an archive.org host under it
+# (defense in depth — the real removal is index.html hiding every UI path
+# that could construct such a URL), and desktop/build-lite.ps1 builds with it.
+[features]
+lite = []
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pure-Rust USB enumeration (uses the OS APIs directly on Windows — no libusb
+# DLL to ship), for detecting a Switch plugged in over USB.
+nusb = "0.1"
+# Blocking HTTP client with pure-Rust rustls TLS (no OpenSSL DLL to ship), for
+# streaming archive.org downloads to disk free of the WebView's CORS limits.
+ureq = "2"
+# Native folder picker (first-party Tauri plugin), for "save to any folder".
+tauri-plugin-dialog = "2"
+# Zip reader for the Library's one-click "unzip & delete". default-features off
+# keeps only pure-Rust deflate (flate2's rust_backend = miniz_oxide) + stored —
+# no bzip2/zstd/lzma C deps, so still nothing extra to ship.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# 7z reader for the Library extract step. Its LZMA/LZMA2/BCJ decoders are pure
+# Rust (lzma-rust); default features keep it that way (no zstd/bzip2 C deps).
+sevenz-rust = "0.6"
+# RAR reader. Statically links its bundled unrar C++ source (built with cc — no
+# external DLL to ship), so the app stays a single copy-anywhere .exe.
+unrar = "0.5"
+# Pure-Rust AES-128-CTR + SHA-256 primitives (used by the optional local
+# post-download ROM conversion). No C/DLL deps to ship.
+aes = "0.8"
+ctr = "0.9"
+sha2 = "0.10"
+# Console Art dialog: base64 in/out for the crop step (read a picked image's
+# bytes into the frontend's canvas, then write the cropped/resized PNG back to
+# a temp file for wifi_push). Pure Rust, no C deps.
+base64 = "0.22"
+
+# Windows Portable Devices (WPD) COM API, to read the device inventory back over
+# USB. A PTP/MTP-class device is owned by the OS MTP driver on Windows (WinUSB
+# isn't bound, so raw nusb can't claim it) — WPD talks to the same MTP object
+# tree through the stack that already owns the device. Links system DLLs only,
+# nothing extra to ship.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Devices_PortableDevices",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
