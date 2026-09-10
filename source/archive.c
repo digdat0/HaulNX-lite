@@ -1,0 +1,432 @@
+#include "iarchive.h"
+#include "net.h"
+#include "jsonutil.h"
+#include "fsutil.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* HAULNX_LITE (see Makefile) compiles this whole engine out -- the entire
+ * ROM-acquisition/downloader feature. Every caller in MainApplication.cpp is
+ * guarded the same way, so nothing references these symbols in a Lite build;
+ * an empty translation unit is correct, not a stub. */
+#ifndef HAULNX_LITE
+
+/* ---- identifier extraction ------------------------------------------ */
+
+static void strip_trailing_slashes(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == '/' || s[n - 1] == ' ')) {
+        s[--n] = '\0';
+    }
+}
+
+bool ia_extract_id(const char *input, char *out, size_t out_sz) {
+    if (!input || !out || out_sz == 0) {
+        return false;
+    }
+    while (*input == ' ' || *input == '\t') {
+        input++;
+    }
+
+    char work[1024];
+    snprintf(work, sizeof(work), "%s", input);
+    strip_trailing_slashes(work);
+
+    char *q = strpbrk(work, "?#");
+    if (q) {
+        *q = '\0';
+    }
+
+    const char *markers[] = {"/details/", "/download/", "/metadata/",
+                             "/serve/"};
+    const char *id = NULL;
+    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
+        char *m = strstr(work, markers[i]);
+        if (m) {
+            id = m + strlen(markers[i]);
+            break;
+        }
+    }
+    if (!id) {
+        if (strstr(work, "://")) {
+            return false;
+        }
+        id = work;
+    }
+
+    char idbuf[256];
+    snprintf(idbuf, sizeof(idbuf), "%s", id);
+    char *slash = strchr(idbuf, '/');
+    if (slash) {
+        *slash = '\0';
+    }
+    if (idbuf[0] == '\0') {
+        return false;
+    }
+    snprintf(out, out_sz, "%s", idbuf);
+    return true;
+}
+
+/* ---- metadata fetch + parse ----------------------------------------- */
+
+/* Parse a metadata JSON document into *item (identifier must be set already). */
+static bool parse_metadata(const char *body, size_t len, ArchiveItem *item) {
+    int ntok = 0;
+    jsmntok_t *tok = json_parse_alloc(body, len, &ntok);
+    if (!tok || tok[0].type != JSMN_OBJECT) {
+        free(tok);
+        return false;
+    }
+
+    json_copy(body, tok, json_obj_get(body, tok, 0, "server"), item->server,
+              sizeof(item->server));
+    json_copy(body, tok, json_obj_get(body, tok, 0, "dir"), item->dir,
+              sizeof(item->dir));
+
+    int files_idx = json_obj_get(body, tok, 0, "files");
+    if (files_idx < 0 || tok[files_idx].type != JSMN_ARRAY) {
+        free(tok);
+        return false;
+    }
+
+    int count = tok[files_idx].size;
+    item->files =
+        (ArchiveFile *)calloc(count > 0 ? count : 1, sizeof(ArchiveFile));
+    if (!item->files) {
+        free(tok);
+        return false;
+    }
+
+    int child = files_idx + 1;
+    int added = 0;
+    for (int i = 0; i < count; i++) {
+        if (tok[child].type == JSMN_OBJECT) {
+            ArchiveFile *f = &item->files[added];
+            json_copy(body, tok, json_obj_get(body, tok, child, "name"),
+                      f->name, sizeof(f->name));
+            json_copy(body, tok, json_obj_get(body, tok, child, "format"),
+                      f->format, sizeof(f->format));
+            f->size =
+                json_u64_size(body, tok, json_obj_get(body, tok, child, "size"));
+            json_copy(body, tok, json_obj_get(body, tok, child, "md5"), f->md5,
+                      sizeof(f->md5));
+            if (f->name[0]) {
+                added++;
+            }
+        }
+        child = json_tok_skip(tok, child);
+    }
+    item->file_count = added;
+    if (added == 0) {
+        /* Parsed but no usable files: free the allocation so it doesn't leak
+         * (callers don't ia_free on a failed fetch). */
+        free(item->files);
+        item->files = NULL;
+    }
+
+    free(tok);
+    return added > 0;
+}
+
+/* Build a safe cache file path for an identifier. */
+static void cache_path_for(const char *cache_dir, const char *id, char *out,
+                           size_t out_sz) {
+    char safe[256];
+    size_t o = 0;
+    for (const char *p = id; *p && o + 1 < sizeof(safe); p++) {
+        char c = *p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+            safe[o++] = c;
+        } else {
+            safe[o++] = '_';
+        }
+    }
+    safe[o] = '\0';
+    snprintf(out, out_sz, "%s/%s.json", cache_dir, safe);
+}
+
+static bool ia_fetch_impl(void *conn, const char *identifier, ArchiveItem *item,
+                          bool use_cache, const char *cache_dir) {
+    if (!identifier || !item) {
+        return false;
+    }
+    memset(item, 0, sizeof(*item));
+    snprintf(item->identifier, sizeof(item->identifier), "%s", identifier);
+
+    char cpath[1024] = {0};
+    if (cache_dir) {
+        cache_path_for(cache_dir, identifier, cpath, sizeof(cpath));
+    }
+
+    char *body = NULL;
+    size_t len = 0;
+
+    if (use_cache && cache_dir) {
+        body = json_read_file(cpath, &len);
+        if (body) {
+            if (parse_metadata(body, len, item)) {
+                free(body);
+                return true;
+            }
+            /* Corrupt/stale cache (bad write, error page): refetch instead of
+             * failing forever until the user manually clears the cache. */
+            free(body);
+        }
+    }
+
+    char url[512];
+    snprintf(url, sizeof(url), "https://archive.org/metadata/%s", identifier);
+    long code = 0;
+    /* conn != NULL: fetch on a caller-owned worker connection (parallel
+     * refresh). NULL: the shared, serialized handle. */
+    body = conn ? http_get_on(conn, url, &code, &len)
+                : http_get(url, &code, &len);
+    if (!body) {
+        return false;
+    }
+    if (code != 200 || len < 2) {
+        free(body);
+        return false;
+    }
+
+    bool ok = parse_metadata(body, len, item);
+    /* Only cache metadata that actually parsed, so a bad response (item
+     * removed, error JSON) can't poison the cache. */
+    if (ok && cache_dir) {
+        fs_mkdir_p(cache_dir);
+        FILE *f = fopen(cpath, "wb");
+        if (f) {
+            /* A short write here is self-healing — the truncated JSON fails to
+             * parse on the next load and we refetch, per above. But leaving the
+             * corrupt file on the card costs that round-trip every single time,
+             * so drop it now. stdio buffers, so check fclose too. */
+            bool wrote = (fwrite(body, 1, len, f) == len);
+            if (fclose(f) != 0 || !wrote) {
+                remove(cpath);
+            }
+        }
+    }
+    free(body);
+    return ok;
+}
+
+bool ia_fetch(const char *identifier, ArchiveItem *item, bool use_cache,
+              const char *cache_dir) {
+    return ia_fetch_impl(NULL, identifier, item, use_cache, cache_dir);
+}
+
+bool ia_fetch_on(void *conn, const char *identifier, ArchiveItem *item,
+                 bool use_cache, const char *cache_dir) {
+    return ia_fetch_impl(conn, identifier, item, use_cache, cache_dir);
+}
+
+/* Percent-encode a file path: keep unreserved chars and '/' (path separator),
+ * encode everything else (spaces, ()[]!, etc). archive.org returns 400 for
+ * unencoded paths. */
+static void url_encode_path(const char *in, char *out, size_t out_sz) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in;
+         *p && o + 4 < out_sz; p++) {
+        unsigned char c = *p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+            c == '~' || c == '/') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 0xF];
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Percent-decode a URL path component: %XX -> byte. '+' is left literal --
+ * archive.org paths encode a space as %20, never '+'. */
+static void url_decode_path(const char *in, char *out, size_t out_sz) {
+    size_t o = 0;
+    for (const char *p = in; *p && o + 1 < out_sz;) {
+        if (p[0] == '%' && isxdigit((unsigned char)p[1]) &&
+            isxdigit((unsigned char)p[2])) {
+            char hex[3] = {p[1], p[2], '\0'};
+            out[o++] = (char)strtol(hex, NULL, 16);
+            p += 3;
+        } else {
+            out[o++] = *p++;
+        }
+    }
+    out[o] = '\0';
+}
+
+bool ia_item_subfolder(const ArchiveItem *item, char *out, size_t out_sz) {
+    if (!item || !out || out_sz == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    if (!item->download_base[0] || !item->identifier[0]) {
+        return false;
+    }
+    char base[512];
+    snprintf(base, sizeof(base), "%s", item->download_base);
+    strip_trailing_slashes(base);
+
+    char marker[288];
+    snprintf(marker, sizeof(marker), "/download/%s", item->identifier);
+    char *m = strstr(base, marker);
+    if (!m || m[strlen(marker)] != '/') {
+        return false; /* item root, or a custom/mirror base -- no subfolder */
+    }
+    const char *sub = m + strlen(marker) + 1; /* past the slash */
+    if (!*sub) {
+        return false;
+    }
+    url_decode_path(sub, out, out_sz);
+    return out[0] != '\0';
+}
+
+void ia_file_url(const ArchiveItem *item, const ArchiveFile *file,
+                 char *out, size_t out_sz) {
+    char base[512];
+    if (item->download_base[0]) {
+        snprintf(base, sizeof(base), "%s", item->download_base);
+    } else {
+        snprintf(base, sizeof(base), "https://archive.org/download/%s",
+                 item->identifier);
+    }
+    strip_trailing_slashes(base);
+
+    /* A base may point into a subfolder of the item, e.g.
+     *   https://archive.org/download/nds_apfix/apfix
+     * Metadata file names are relative to the item root and already carry that
+     * subfolder ("apfix/rom.zip"), so appending the name whole would double it
+     * and 404. Strip the subfolder from the name instead -- and for a file
+     * that lives outside the subfolder (item-level metadata, a sibling
+     * folder), fall back to the item root, which is what its name is relative
+     * to. Custom mirror bases have no such marker and are used as-is. */
+    char prefix[512];
+    size_t skip = 0;
+    if (ia_item_subfolder(item, prefix, sizeof(prefix))) {
+        size_t plen = strlen(prefix);
+        if (plen > 0 && strncmp(file->name, prefix, plen) == 0 &&
+            file->name[plen] == '/') {
+            skip = plen + 1;
+        } else {
+            /* outside the subfolder: fall back to the item root, which is
+             * what its (unstripped) name is relative to */
+            char marker[288];
+            snprintf(marker, sizeof(marker), "/download/%s", item->identifier);
+            char *m = strstr(base, marker);
+            if (m && m[strlen(marker)] == '/') {
+                m[strlen(marker)] = '\0';
+            }
+        }
+    }
+
+    char enc[1024];
+    url_encode_path(file->name + skip, enc, sizeof(enc));
+    snprintf(out, out_sz, "%s/%s", base, enc);
+}
+
+/* ---- catalogue search ----------------------------------------------- */
+
+/* Percent-encode a full query component: keep only unreserved characters and
+ * encode everything else (spaces, quotes, ':' in field queries, ...). */
+static void url_encode_query(const char *in, char *out, size_t out_sz) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in;
+         *p && o + 4 < out_sz; p++) {
+        unsigned char c = *p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+            c == '~') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 0xF];
+        }
+    }
+    out[o] = '\0';
+}
+
+int ia_search(void *conn, const char *query, ArchiveSearchItem *out, int max) {
+    if (!query || !out || max <= 0) {
+        return -1;
+    }
+    char eq[600];
+    url_encode_query(query, eq, sizeof(eq));
+    char url[1024];
+    snprintf(url, sizeof(url),
+             "https://archive.org/advancedsearch.php?q=%s"
+             "&fl[]=identifier&fl[]=title&fl[]=mediatype&fl[]=downloads"
+             "&sort[]=downloads+desc&rows=%d&page=1&output=json",
+             eq, max);
+
+    long code = 0;
+    size_t len = 0;
+    char *body = conn ? http_get_on(conn, url, &code, &len)
+                      : http_get(url, &code, &len);
+    if (!body) {
+        return -1;
+    }
+    if (code != 200 || len < 2) {
+        free(body);
+        return -1;
+    }
+
+    int ntok = 0;
+    jsmntok_t *tok = json_parse_alloc(body, len, &ntok);
+    if (!tok || tok[0].type != JSMN_OBJECT) {
+        free(tok);
+        free(body);
+        return -1;
+    }
+    int resp = json_obj_get(body, tok, 0, "response");
+    int docs = resp >= 0 ? json_obj_get(body, tok, resp, "docs") : -1;
+    if (docs < 0 || tok[docs].type != JSMN_ARRAY) {
+        free(tok);
+        free(body);
+        return -1;
+    }
+
+    int count = tok[docs].size;
+    int child = docs + 1;
+    int added = 0;
+    for (int i = 0; i < count && added < max; i++) {
+        if (tok[child].type == JSMN_OBJECT) {
+            ArchiveSearchItem *s = &out[added];
+            memset(s, 0, sizeof(*s));
+            json_copy(body, tok, json_obj_get(body, tok, child, "identifier"),
+                      s->identifier, sizeof(s->identifier));
+            json_copy(body, tok, json_obj_get(body, tok, child, "title"),
+                      s->title, sizeof(s->title));
+            json_copy(body, tok, json_obj_get(body, tok, child, "mediatype"),
+                      s->mediatype, sizeof(s->mediatype));
+            int di = json_obj_get(body, tok, child, "downloads");
+            s->downloads = di >= 0 ? json_u64(body, tok, di) : 0;
+            if (s->identifier[0]) {
+                added++;
+            }
+        }
+        child = json_tok_skip(tok, child);
+    }
+    free(tok);
+    free(body);
+    return added;
+}
+
+void ia_free(ArchiveItem *item) {
+    if (item && item->files) {
+        free(item->files);
+        item->files = NULL;
+        item->file_count = 0;
+    }
+}
+
+#endif /* HAULNX_LITE */
