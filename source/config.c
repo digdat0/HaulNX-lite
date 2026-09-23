@@ -1,0 +1,1357 @@
+#include "config.h"
+#include "jsonutil.h"
+#include "fsutil.h"
+#include "version.h"
+
+#include <switch.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+/* ---- diagnostics bundle ------------------------------------------------ */
+
+/* Serializes diag_bundle_write -- it's callable from both the UI thread
+ * (Diagnostics screen export, httpsrv's /debug_bundle.txt route) and the MTP
+ * responder's own worker thread (its debug_bundle.txt root object). Without
+ * this, two concurrent fopen(path,"wb") writers can interleave and leave the
+ * bundle truncated or with spliced content. Zero-initialized statically is a
+ * valid unlocked Mutex (see mutexInit's own doc comment) -- no explicit init
+ * call needed. */
+static Mutex g_diag_mtx;
+
+/* Copy one log's whole contents into the bundle, headed by a "==== label
+ * (path) ====" marker so it's easy to find in a pasted report. Missing is not
+ * an error (most logs only exist once their feature has run). */
+static void bundle_append(FILE *out, const char *label, const char *path) {
+    FILE *in = fopen(path, "rb");
+    fprintf(out, "==== %s (%s) ====\n", label, path);
+    if (!in) {
+        fprintf(out, "(not present)\n\n");
+        return;
+    }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        fwrite(buf, 1, n, out);
+    }
+    fprintf(out, "\n\n");
+    fclose(in);
+}
+
+bool diag_bundle_write(void) {
+    mutexLock(&g_diag_mtx);
+    fs_mkdir_p(LOGS_DIR);
+    FILE *out = fopen(DIAG_BUNDLE_PATH, "wb");
+    if (!out) {
+        mutexUnlock(&g_diag_mtx);
+        return false;
+    }
+    fprintf(out, "HaulNX v%s debug bundle\n\n", APP_VERSION_STR);
+    bundle_append(out, "debug", LOG_PATH);
+    bundle_append(out, "transfers", XFERLOG_PATH);
+    bundle_append(out, "speedtest", SPEEDLOG_PATH);
+    bundle_append(out, "downloads", DLLOG_PATH);
+    bundle_append(out, "extract-bench", EXBENCH_PATH);
+    bundle_append(out, "queue-state", QUEUE_STATE_PATH);
+    bool ok = fclose(out) == 0;
+    mutexUnlock(&g_diag_mtx);
+    return ok;
+}
+
+/* Bounded string copy. A plain byte loop (not snprintf) so the compiler doesn't
+ * warn about member-to-member copies within the same struct. */
+static void sset(char *dst, size_t dsz, const char *src) {
+    if (dsz == 0) {
+        return;
+    }
+    size_t i = 0;
+    if (src) {
+        for (; src[i] && i + 1 < dsz; i++) {
+            dst[i] = src[i];
+        }
+    }
+    dst[i] = '\0';
+}
+
+/* ---- on-disk layout migration ---------------------------------------- */
+
+void app_migrate_layout(void) {
+    /* Builds up to 1.0.2 wrote every config file and log directly under
+     * CONFIG_DIR. They now live in config/ and logs/. Relocate any leftover so
+     * an in-place update keeps the user's collections, credentials, prefs,
+     * queue, size cache and log history instead of silently starting fresh.
+     * Each move is guarded twice: it only runs when the old file is present and
+     * the new one is not, so it never clobbers a current file and stops being a
+     * no-op-with-a-stat once everything has moved. fs_move creates the parent. */
+    fs_mkdir_p(DATA_DIR);
+    fs_mkdir_p(LOGS_DIR);
+    static const struct {
+        const char *old;
+        const char *cur;
+    } moves[] = {
+        /* config/ — JSON state and derived caches */
+        {CONFIG_DIR "/dl_sources.json", SOURCES_PATH},
+        {CONFIG_DIR "/dl_sources.bak.json", SOURCES_BAK_PATH},
+        {CONFIG_DIR "/dl_sources.bak2.json", SOURCES_BAK2_PATH},
+        {CONFIG_DIR "/credentials.json", CREDS_PATH},
+        {CONFIG_DIR "/prefs.json", PREFS_PATH},
+        {CONFIG_DIR "/queue.json", QUEUE_STATE_PATH},
+        {CONFIG_DIR "/inst_sizes.json", INST_SIZES_PATH},
+        /* logs/ — the live logs and their one rotated ".1" generation, moved
+         * together so a log's history isn't split across two folders */
+        {CONFIG_DIR "/debug.log", LOG_PATH},
+        {CONFIG_DIR "/debug.log.1", LOG_PATH ".1"},
+        {CONFIG_DIR "/exbench.log", EXBENCH_PATH},
+        {CONFIG_DIR "/exbench.log.1", EXBENCH_PATH ".1"},
+        {CONFIG_DIR "/transfers.log", XFERLOG_PATH},
+        {CONFIG_DIR "/transfers.log.1", XFERLOG_PATH ".1"},
+        {CONFIG_DIR "/speedtest.log", SPEEDLOG_PATH},
+        {CONFIG_DIR "/speedtest.log.1", SPEEDLOG_PATH ".1"},
+        {CONFIG_DIR "/downloads.log", DLLOG_PATH},
+        {CONFIG_DIR "/downloads.log.1", DLLOG_PATH ".1"},
+        {CONFIG_DIR "/downloads.jsonl", DLLOG_JSON},
+        {CONFIG_DIR "/downloads.jsonl.1", DLLOG_JSON ".1"},
+    };
+    for (size_t i = 0; i < sizeof(moves) / sizeof(moves[0]); i++) {
+        if (fs_exists(moves[i].old) && !fs_exists(moves[i].cur)) {
+            fs_move(moves[i].old, moves[i].cur);
+        }
+    }
+}
+
+/* Add a name to the supported-console list if absent and there's room. */
+static void add_supported(SourcesConfig *cfg, const char *name) {
+    if (!name || !name[0] || cfg->supported_count >= MAX_CONSOLES) {
+        return;
+    }
+    for (int i = 0; i < cfg->supported_count; i++) {
+        if (strcmp(cfg->supported[i], name) == 0) {
+            return;
+        }
+    }
+    sset(cfg->supported[cfg->supported_count], 64, name);
+    cfg->supported_count++;
+}
+
+/* ---- sources ---------------------------------------------------------- */
+
+static void seed_from_romfs(void) {
+    if (fs_exists(SOURCES_PATH)) {
+        return;
+    }
+    size_t len = 0;
+    char *def = json_read_file("romfs:/dl_sources.json", &len);
+    if (!def) {
+        return;
+    }
+    fs_mkdir_p(DATA_DIR);
+    FILE *f = fopen(SOURCES_PATH, "wb");
+    if (f) {
+        fwrite(def, 1, len, f);
+        fclose(f);
+    }
+    free(def);
+}
+
+/* Merge the romfs master console list into an already-loaded config. The saved
+ * dl_sources.json on the SD card may have been written by an OLDER app version
+ * that only knew a subset of consoles; this adds any consoles the current build
+ * ships (in romfs) that the saved file is missing, so app updates introduce new
+ * supported consoles without disturbing the user's repos or groups. Purely
+ * additive: add_supported() skips duplicates and never removes anything. */
+static void merge_supported_from_romfs(SourcesConfig *cfg) {
+    size_t len = 0;
+    char *js = json_read_file("romfs:/dl_sources.json", &len);
+    if (!js) {
+        return;
+    }
+    int ntok = 0;
+    jsmntok_t *tok = json_parse_alloc(js, len, &ntok);
+    if (tok && tok[0].type == JSMN_OBJECT) {
+        /* "consoles" is the current key; "tico_consoles" is the legacy name
+         * still accepted so older SD-card files keep loading. */
+        int ti = json_obj_get(js, tok, 0, "consoles");
+        if (ti < 0) {
+            ti = json_obj_get(js, tok, 0, "tico_consoles");
+        }
+        if (ti >= 0 && tok[ti].type == JSMN_ARRAY) {
+            int n = tok[ti].size, c = ti + 1;
+            for (int i = 0; i < n; i++) {
+                if (tok[c].type == JSMN_STRING) {
+                    char name[64];
+                    json_copy(js, tok, c, name, sizeof(name));
+                    add_supported(cfg, name);
+                }
+                c = json_tok_skip(tok, c);
+            }
+        }
+    }
+    free(tok);
+    free(js);
+}
+
+static bool console_hidden_by_default(const char *name); /* defined below */
+static bool console_is_new(const char *name);            /* defined below */
+
+/* Ensure every supported console has a (possibly empty) group so the Browse tab
+ * lists all known consoles up front, not just those with repos — giving users a
+ * folder to add repos into. Idempotent: consoles that already have a group are
+ * left untouched, so existing repos, order, and shown/hidden state are never
+ * disturbed. Freshly seeded groups honor console_hidden_by_default(), so niche
+ * systems ship hidden and the user re-enables them in Settings -> Manage
+ * consoles. Because existing groups are skipped, this only sets the default for
+ * a console the first time it appears (fresh install, or an app update that adds
+ * it) — it never re-hides one the user has already chosen to show. */
+static void seed_console_groups(SourcesConfig *cfg) {
+    for (int i = 0; i < cfg->supported_count; i++) {
+        const char *name = cfg->supported[i];
+        if (!name[0] || config_find_console(cfg, name)) {
+            continue;
+        }
+        if (cfg->console_count >= MAX_CONSOLES) {
+            break;
+        }
+        ConsoleGroup *g = &cfg->consoles[cfg->console_count++];
+        memset(g, 0, sizeof(*g));
+        sset(g->console, sizeof(g->console), name);
+        sset(g->target, sizeof(g->target), name);
+        g->shown = !console_hidden_by_default(name);
+        /* New (post-launch) consoles default off on Installed too; the original
+         * launch set keeps its prior "shown on Installed" default -- except
+         * atomiswave/naomi, hidden from Browse since launch (niche arcade
+         * systems) but left visible on Installed by an oversight: a fresh
+         * install showed an empty "Sammy Atomiswave" folder in the Library
+         * tab the user never opted into. console_hidden_by_default() already
+         * covers exactly "console_is_new() plus atomiswave/naomi", so this is
+         * the same rule shown uses above, not a separate one to keep in sync. */
+        g->shown_installed = !console_hidden_by_default(name);
+    }
+}
+
+void repo_set_url_default(Repo *r) {
+    if (!r->download_base[0] && r->id[0]) {
+        char tmp[512];
+        snprintf(tmp, sizeof(tmp), "https://archive.org/download/%s", r->id);
+        snprintf(r->download_base, sizeof(r->download_base), "%s", tmp);
+    }
+}
+
+const char *config_console_folder(SourcesConfig *cfg, const char *target) {
+    ConsoleGroup *g = config_find_console(cfg, target);
+    return (g && g->folder[0]) ? g->folder : "";
+}
+
+ConsoleGroup *config_find_console(SourcesConfig *cfg, const char *name) {
+    for (int i = 0; i < cfg->console_count; i++) {
+        if (strcmp(cfg->consoles[i].console, name) == 0 ||
+            strcmp(cfg->consoles[i].target, name) == 0) {
+            return &cfg->consoles[i];
+        }
+    }
+    return NULL;
+}
+
+/* Consoles added after the initial release. They ship disabled in BOTH the
+ * Browse and the Installed lists, so an app update never lights up systems the
+ * user never asked for: an existing library keeps exactly the consoles it had,
+ * and these are opted into per-section via Settings -> Manage consoles. The
+ * original launch set is deliberately NOT listed here, so it keeps its prior
+ * defaults (shown on Browse unless in the original hidden set below, and shown
+ * on Installed). Only affects newly seeded consoles; a saved config is never
+ * disturbed. */
+static bool console_is_new(const char *name) {
+    static const char *added[] = {
+        "fds", "virtual-boy", "pokemon-mini", "game-and-watch", "sg-1000",
+        "sega-32x", "pc-engine", "pc-engine-cd", "supergrafx", "pc-fx",
+        "neo-geo", "neo-geo-cd", "neo-geo-pocket", "neo-geo-pocket-color",
+        "atari-2600", "atari-5200", "atari-7800", "atari-lynx", "atari-jaguar",
+        "wonderswan", "wonderswan-color", "colecovision", "intellivision",
+        "odyssey2", "vectrex", "channel-f", "3do", "cd-i", "supervision",
+        "arcade", "fbneo",
+        /* experimental — Wii U, playable only via the unofficial Cemu Switch
+         * port; off by default so it doesn't imply first-class on-device
+         * support */
+        "wiiu",
+        /* playable only via an unofficial emulator port (uae4all2, Vapor
+         * Spec, etc.) rather than first-party/well-established Switch
+         * homebrew; off by default for the same reason as wiiu above.
+         * ("vita" was here too until 2026-08-30, when it got a proper
+         * console icon and was moved to the default-shown set below.) */
+        "amiga", "zx-spectrum", "chip8", "pico8", "tamagotchi", "flash",
+        /* emulator-only, no established ROM source -- off by default like the
+         * rest of this niche-homebrew tail */
+        "j2me", "v-smile"};
+    for (size_t i = 0; i < sizeof(added) / sizeof(added[0]); i++) {
+        if (strcasecmp(name, added[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Consoles hidden from the Browse list on a fresh install. "atomiswave" and
+ * "naomi" were hidden at launch (niche arcade systems) and stay that way to
+ * match the original defaults; every post-launch console is hidden from Browse
+ * too. Consoles can be re-shown via Settings -> Manage consoles. Only affects
+ * newly seeded consoles; an existing saved config keeps whatever the user set. */
+static bool console_hidden_by_default(const char *name) {
+    if (strcasecmp(name, "atomiswave") == 0 ||
+        strcasecmp(name, "naomi") == 0) {
+        return true;
+    }
+    return console_is_new(name);
+}
+
+void config_console_default_vis(const char *name, bool *shown,
+                                bool *shown_installed) {
+    if (shown) *shown = !console_hidden_by_default(name);
+    /* Same rule as seed_console_groups' shown_installed -- see its comment. */
+    if (shown_installed) *shown_installed = !console_hidden_by_default(name);
+}
+
+ConsoleGroup *config_add_console(SourcesConfig *cfg, const char *name) {
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    ConsoleGroup *g = config_find_console(cfg, name);
+    if (g) {
+        return g;
+    }
+    if (cfg->console_count >= MAX_CONSOLES) {
+        return NULL;
+    }
+    g = &cfg->consoles[cfg->console_count++];
+    memset(g, 0, sizeof(*g));
+    sset(g->console, sizeof(g->console), name);
+    sset(g->target, sizeof(g->target), name);
+    g->shown = !console_hidden_by_default(name);
+    /* Same rule as seed_console_groups' shown_installed -- see its comment. */
+    g->shown_installed = !console_hidden_by_default(name);
+    return g;
+}
+
+bool config_remove_console(SourcesConfig *cfg, int idx) {
+    if (idx < 0 || idx >= cfg->console_count) {
+        return false;
+    }
+    for (int i = idx; i < cfg->console_count - 1; i++) {
+        cfg->consoles[i] = cfg->consoles[i + 1];
+    }
+    cfg->console_count--;
+    return true;
+}
+
+static int cmp_console(const void *a, const void *b) {
+    const ConsoleGroup *x = (const ConsoleGroup *)a;
+    const ConsoleGroup *y = (const ConsoleGroup *)b;
+    return strcasecmp(x->console, y->console);
+}
+
+void config_sort(SourcesConfig *cfg) {
+    qsort(cfg->consoles, cfg->console_count, sizeof(ConsoleGroup), cmp_console);
+}
+
+void config_seed_rom_folders(const SourcesConfig *cfg, const char *roms_root) {
+    if (!cfg || !roms_root || !roms_root[0]) {
+        return;
+    }
+    /* fs_mkdir_p is a no-op when the folder already exists, so this only ever
+     * creates the missing ones. Uses the master supported list (consoles),
+     * which covers every console the app knows about, not just those with
+     * repos configured. */
+    for (int i = 0; i < cfg->supported_count; i++) {
+        if (!cfg->supported[i][0]) {
+            continue;
+        }
+        char dir[1024];
+        snprintf(dir, sizeof(dir), "%s/%s", roms_root, cfg->supported[i]);
+        fs_mkdir_p(dir);
+    }
+}
+
+Repo *config_add_repo(ConsoleGroup *g, const char *label, const char *id) {
+#ifdef HAULNX_LITE
+    /* The ROM-acquisition/downloader feature is compiled out entirely in
+     * Lite builds -- see HAULNX_LITE in the Makefile and the matching strip
+     * in parse_sources_buf() above (this is the OTHER way a repo can appear:
+     * a manual add, rather than a loaded/imported document). */
+    (void)g; (void)label; (void)id;
+    return NULL;
+#else
+    if (!g || g->repo_count >= MAX_REPOS) {
+        return NULL;
+    }
+    Repo *r = &g->repos[g->repo_count++];
+    memset(r, 0, sizeof(*r));
+    sset(r->label, sizeof(r->label), (label && label[0]) ? label : id);
+    sset(r->id, sizeof(r->id), id);
+    r->enabled = true;
+    repo_set_url_default(r);
+    return r;
+#endif /* HAULNX_LITE */
+}
+
+bool config_remove_repo(ConsoleGroup *g, int idx) {
+    if (!g || idx < 0 || idx >= g->repo_count) {
+        return false;
+    }
+    for (int i = idx; i < g->repo_count - 1; i++) {
+        g->repos[i] = g->repos[i + 1];
+    }
+    g->repo_count--;
+    return true;
+}
+
+/* Parse one repo object (token `obj`) into *r. Returns true if it has an id. */
+static bool parse_repo(const char *js, jsmntok_t *tok, int obj, Repo *r) {
+    memset(r, 0, sizeof(*r));
+    json_copy(js, tok, json_obj_get(js, tok, obj, "label"), r->label,
+              sizeof(r->label));
+    json_copy(js, tok, json_obj_get(js, tok, obj, "a_id"), r->id,
+              sizeof(r->id));
+    json_copy(js, tok, json_obj_get(js, tok, obj, "URL"), r->download_base,
+              sizeof(r->download_base));
+    r->enabled = json_bool(js, tok, json_obj_get(js, tok, obj, "active"));
+    int pi = json_obj_get(js, tok, obj, "pinned");
+    r->pinned = (pi >= 0) ? json_bool(js, tok, pi) : false;
+    if (!r->label[0]) {
+        sset(r->label, sizeof(r->label), r->id);
+    }
+    repo_set_url_default(r);
+    return r->id[0] != '\0';
+}
+
+/* New grouped schema: { "console_list_groups": [ {console,target,repos:[...]} ] } */
+static bool load_grouped(const char *js, jsmntok_t *tok, SourcesConfig *cfg) {
+    int gi = json_obj_get(js, tok, 0, "console_list_groups");
+    if (gi < 0 || tok[gi].type != JSMN_ARRAY) {
+        return false;
+    }
+    int count = tok[gi].size;
+    int child = gi + 1;
+    for (int i = 0; i < count && cfg->console_count < MAX_CONSOLES; i++) {
+        if (tok[child].type == JSMN_OBJECT) {
+            ConsoleGroup *g = &cfg->consoles[cfg->console_count];
+            memset(g, 0, sizeof(*g));
+            json_copy(js, tok, json_obj_get(js, tok, child, "console"),
+                      g->console, sizeof(g->console));
+            json_copy(js, tok, json_obj_get(js, tok, child, "target"),
+                      g->target, sizeof(g->target));
+            if (!g->target[0]) {
+                sset(g->target, sizeof(g->target), g->console);
+            }
+            if (!g->console[0]) {
+                sset(g->console, sizeof(g->console), g->target);
+            }
+            /* Absent "shown" defaults to true so existing configs are unchanged. */
+            int shtok = json_obj_get(js, tok, child, "shown");
+            g->shown = (shtok < 0) ? true : json_bool(js, tok, shtok);
+            /* Absent "shown_installed" defaults to true: pre-existing configs
+             * keep every console visible on the Installed tab as before. */
+            int sitok = json_obj_get(js, tok, child, "shown_installed");
+            g->shown_installed = (sitok < 0) ? true : json_bool(js, tok, sitok);
+            /* Absent "pinned" defaults to false — an unpinned console. */
+            int pntok = json_obj_get(js, tok, child, "pinned");
+            g->pinned = (pntok < 0) ? false : json_bool(js, tok, pntok);
+            /* Absent "folder" leaves it empty — the default <roms_root>/<target>. */
+            json_copy(js, tok, json_obj_get(js, tok, child, "folder"),
+                      g->folder, sizeof(g->folder));
+            /* Absent "use_boxart" defaults to false — the built-in icon. */
+            int ubtok = json_obj_get(js, tok, child, "use_boxart");
+            g->use_boxart = (ubtok < 0) ? false : json_bool(js, tok, ubtok);
+            int reps = json_obj_get(js, tok, child, "repos");
+            if (reps >= 0 && tok[reps].type == JSMN_ARRAY) {
+                int rc = tok[reps].size;
+                int rchild = reps + 1;
+                for (int r = 0; r < rc && g->repo_count < MAX_REPOS; r++) {
+                    if (tok[rchild].type == JSMN_OBJECT &&
+                        parse_repo(js, tok, rchild, &g->repos[g->repo_count])) {
+                        g->repo_count++;
+                    }
+                    rchild = json_tok_skip(tok, rchild);
+                }
+            }
+            if (g->console[0]) {
+                cfg->console_count++;
+            }
+        }
+        child = json_tok_skip(tok, child);
+    }
+    return cfg->console_count > 0;
+}
+
+/* Legacy schema: { "sources":[{console,a_id,dl_source,active,URL}],
+ * "console_list":[...] } -> one console group per dl_source. */
+static void load_legacy(const char *js, jsmntok_t *tok, SourcesConfig *cfg) {
+    int targets = json_obj_get(js, tok, 0, "console_list");
+    if (targets >= 0 && tok[targets].type == JSMN_ARRAY) {
+        int n = tok[targets].size, c = targets + 1;
+        for (int i = 0; i < n; i++) {
+            if (tok[c].type == JSMN_STRING) {
+                char name[64];
+                json_copy(js, tok, c, name, sizeof(name));
+                if (name[0]) {
+                    config_add_console(cfg, name);
+                }
+            }
+            c = json_tok_skip(tok, c);
+        }
+    }
+    int sources = json_obj_get(js, tok, 0, "sources");
+    if (sources >= 0 && tok[sources].type == JSMN_ARRAY) {
+        int n = tok[sources].size, c = sources + 1;
+        for (int i = 0; i < n; i++) {
+            if (tok[c].type == JSMN_OBJECT) {
+                char tgt[64], label[64];
+                json_copy(js, tok, json_obj_get(js, tok, c, "dl_source"), tgt,
+                          sizeof(tgt));
+                json_copy(js, tok, json_obj_get(js, tok, c, "console"), label,
+                          sizeof(label));
+                if (tgt[0]) {
+                    ConsoleGroup *g = config_add_console(cfg, tgt);
+                    if (g && g->repo_count < MAX_REPOS) {
+                        Repo *r = &g->repos[g->repo_count];
+                        memset(r, 0, sizeof(*r));
+                        sset(r->label, sizeof(r->label), label[0] ? label : tgt);
+                        json_copy(js, tok, json_obj_get(js, tok, c, "a_id"),
+                                  r->id, sizeof(r->id));
+                        json_copy(js, tok, json_obj_get(js, tok, c, "URL"),
+                                  r->download_base, sizeof(r->download_base));
+                        r->enabled = json_bool(
+                            js, tok, json_obj_get(js, tok, c, "active"));
+                        repo_set_url_default(r);
+                        if (r->id[0]) {
+                            g->repo_count++;
+                        }
+                    }
+                }
+            }
+            c = json_tok_skip(tok, c);
+        }
+    }
+}
+
+/* Parse a dl_sources.json document into cfg (which the caller has zeroed).
+ * Shared by config_load and config_import_json so an imported file goes through
+ * exactly the same schema handling as the one on disk. */
+static void parse_sources_buf(const char *js, size_t len, SourcesConfig *cfg) {
+    int ntok = 0;
+    jsmntok_t *tok = json_parse_alloc(js, len, &ntok);
+    if (!tok || tok[0].type != JSMN_OBJECT) {
+        free(tok);
+        return;
+    }
+
+    /* Master supported-console list. "consoles" is current; "tico_consoles"
+     * is the legacy key kept for backward compatibility. */
+    int ti = json_obj_get(js, tok, 0, "consoles");
+    if (ti < 0) {
+        ti = json_obj_get(js, tok, 0, "tico_consoles");
+    }
+    if (ti >= 0 && tok[ti].type == JSMN_ARRAY) {
+        int n = tok[ti].size, c = ti + 1;
+        for (int i = 0; i < n; i++) {
+            if (tok[c].type == JSMN_STRING) {
+                char name[64];
+                json_copy(js, tok, c, name, sizeof(name));
+                add_supported(cfg, name);
+            }
+            c = json_tok_skip(tok, c);
+        }
+    }
+
+    if (!load_grouped(js, tok, cfg)) {
+        load_legacy(js, tok, cfg); /* older sources/console_list file */
+    }
+
+    /* Any console that already has a group is, by definition, supported. */
+    for (int i = 0; i < cfg->console_count; i++) {
+        add_supported(cfg, cfg->consoles[i].console);
+    }
+
+#ifdef HAULNX_LITE
+    /* HAULNX_LITE (see Makefile) removes the ROM-acquisition/downloader
+     * feature entirely. This is the one choke point every repo-carrying
+     * document passes through -- the on-disk sources.json at startup, a
+     * dl_sources.json import, and a backup restore all call this same
+     * function (see the comment above it) -- so stripping repos here, rather
+     * than hiding them at every Browse/Search screen individually, guarantees
+     * a Lite build can never end up with a downloadable source no matter
+     * which path a document arrived by. Console groups themselves (folders,
+     * on/off, custom names) are untouched -- only their repo lists are wiped. */
+    for (int i = 0; i < cfg->console_count; i++) {
+        cfg->consoles[i].repo_count = 0;
+    }
+#endif
+
+    free(tok);
+}
+
+void config_load(SourcesConfig *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    seed_from_romfs();
+
+    size_t len = 0;
+    char *js = json_read_file(SOURCES_PATH, &len);
+    if (js) {
+        parse_sources_buf(js, len, cfg);
+        free(js);
+    }
+    /* Backfill the master supported-console list from romfs so an app update
+     * that adds consoles reaches users whose saved config predates them. */
+    merge_supported_from_romfs(cfg);
+    /* Materialize a group for every supported console so Browse shows the full
+     * pre-seeded list, even consoles that have no repos yet. */
+    seed_console_groups(cfg);
+}
+
+static int count_repos(const SourcesConfig *cfg) {
+    int n = 0;
+    for (int i = 0; i < cfg->console_count; i++) {
+        n += cfg->consoles[i].repo_count;
+    }
+    return n;
+}
+
+bool config_probe_json(const char *js, size_t len, int *out_consoles,
+                       int *out_repos) {
+    /* SourcesConfig is ~850 KB: far too big to sit on any stack here. */
+    SourcesConfig *in = calloc(1, sizeof(*in));
+    if (!in) {
+        return false;
+    }
+    parse_sources_buf(js, len, in);
+    bool ok = in->console_count > 0;
+    if (ok) {
+        if (out_consoles) {
+            *out_consoles = in->console_count;
+        }
+        if (out_repos) {
+            *out_repos = count_repos(in);
+        }
+    }
+    free(in);
+    return ok;
+}
+
+static const char *backup_path(int slot) {
+    return slot == 0 ? SOURCES_BAK_PATH : SOURCES_BAK2_PATH;
+}
+
+bool config_backup_info(int slot, int *out_consoles, int *out_repos) {
+    if (slot < 0 || slot >= SOURCES_BAK_SLOTS) {
+        return false;
+    }
+    size_t len = 0;
+    char *js = json_read_file(backup_path(slot), &len);
+    if (!js) {
+        return false;
+    }
+    bool ok = config_probe_json(js, len, out_consoles, out_repos);
+    free(js);
+    return ok;
+}
+
+/* Install `in` as the live collection, parking the current file at `park`.
+ * Takes ownership of `in`.
+ *
+ * `rotate` ages slot 0 into slot 1 first. An import does that, because a new
+ * document arrives and the oldest version has to give way. A restore must not:
+ * it only shuffles versions that already exist, so it parks the live file in the
+ * slot it is restoring from — a straight swap that drops nothing and undoes
+ * itself if repeated. Rotating there would destroy the other backup and refill
+ * it with a copy of what just went live. */
+static bool commit_config(SourcesConfig *cfg, SourcesConfig *in, bool rotate,
+                          const char *park, int *out_consoles, int *out_repos) {
+    /* The incoming file may leave out the consoles list; the master folder list must
+     * never shrink because of what someone chose to export. */
+    for (int i = 0; i < cfg->supported_count; i++) {
+        add_supported(in, cfg->supported[i]);
+    }
+    /* Report the count of consoles the document actually carried (matching the
+     * pre-import probe), captured before seeding pads the list with empties. */
+    int in_consoles = in->console_count;
+    /* Keep Browse showing every supported console after an import/restore too,
+     * not just the consoles the incoming document happened to carry repos for. */
+    seed_console_groups(in);
+    int repos = count_repos(in);
+    config_sort(in);
+
+    /* Move rather than copy: each step is then atomic, since a rename can't
+     * half-finish, and config_save writes a fresh live file immediately after. */
+    if (rotate) {
+        fs_move(SOURCES_BAK_PATH, SOURCES_BAK2_PATH);
+    }
+    fs_move(SOURCES_PATH, park);
+    if (!config_save(in)) {
+        /* Nothing reached disk. Unwind in reverse rather than leave the console
+         * with no collections, and leave cfg untouched so memory and disk agree. */
+        fs_move(park, SOURCES_PATH);
+        if (rotate) {
+            fs_move(SOURCES_BAK2_PATH, SOURCES_BAK_PATH);
+        }
+        free(in);
+        return false;
+    }
+    *cfg = *in;
+    free(in);
+    if (out_consoles) {
+        *out_consoles = in_consoles;
+    }
+    if (out_repos) {
+        *out_repos = repos;
+    }
+    return true;
+}
+
+/* Parse js/len into a fresh config, or NULL if it holds no collections. */
+static SourcesConfig *parse_sources_alloc(const char *js, size_t len) {
+    SourcesConfig *in = calloc(1, sizeof(*in));
+    if (!in) {
+        return NULL;
+    }
+    parse_sources_buf(js, len, in);
+    if (in->console_count <= 0) {
+        free(in); /* not a collection file */
+        return NULL;
+    }
+    return in;
+}
+
+bool config_restore_backup(SourcesConfig *cfg, int slot, int *out_consoles,
+                           int *out_repos) {
+    if (slot < 0 || slot >= SOURCES_BAK_SLOTS) {
+        return false;
+    }
+    size_t len = 0;
+    char *js = json_read_file(backup_path(slot), &len);
+    if (!js) {
+        return false;
+    }
+    SourcesConfig *in = parse_sources_alloc(js, len);
+    free(js); /* parsed into `in` already; the slot file is about to be replaced */
+    if (!in) {
+        return false;
+    }
+    /* Swap: the live file takes the slot this came from. */
+    return commit_config(cfg, in, false, backup_path(slot), out_consoles,
+                         out_repos);
+}
+
+bool config_import_json(SourcesConfig *cfg, const char *js, size_t len,
+                        int *out_consoles, int *out_repos) {
+    SourcesConfig *in = parse_sources_alloc(js, len);
+    if (!in) {
+        return false; /* not a collection file — leave the live config alone */
+    }
+    return commit_config(cfg, in, true, SOURCES_BAK_PATH, out_consoles,
+                         out_repos);
+}
+
+/* Finish a staged write: `f` is the temp file, and on success it replaces dst.
+ *
+ * stdio buffers, so most of the real writing happens inside fclose — a full or
+ * ejected card typically surfaces there rather than at the fputs calls, and
+ * checking only ferror would miss it. Both have to pass before the temp file is
+ * worth moving; if either fails the temp is dropped and dst is left exactly as
+ * it was, which is the whole point of staging. */
+static bool commit_staged(FILE *f, const char *tmp, const char *dst) {
+    bool ok = ferror(f) == 0;
+    if (fclose(f) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        remove(tmp);
+        return false;
+    }
+    return fs_move(tmp, dst);
+}
+
+bool config_save(const SourcesConfig *cfg) {
+    fs_mkdir_p(DATA_DIR);
+    /* Stage to a temp file and move it into place. dl_sources.json is the entire
+     * collection list, so truncating it in place means a full SD card or a console
+     * that dies mid-write leaves the user with nothing. Same pattern a finished
+     * download uses in queue.c. */
+    FILE *f = fopen(SOURCES_TMP_PATH, "wb");
+    if (!f) {
+        return false;
+    }
+    fputs("{\n  \"console_list_groups\": [\n", f);
+    for (int i = 0; i < cfg->console_count; i++) {
+        const ConsoleGroup *g = &cfg->consoles[i];
+        fputs("    {\n      \"console\": ", f);
+        json_write_escaped(f, g->console);
+        fputs(",\n      \"target\": ", f);
+        json_write_escaped(f, g->target);
+        fprintf(f, ",\n      \"shown\": %s", g->shown ? "true" : "false");
+        fprintf(f, ",\n      \"shown_installed\": %s",
+                g->shown_installed ? "true" : "false");
+        fprintf(f, ",\n      \"pinned\": %s", g->pinned ? "true" : "false");
+        /* Only emit "use_boxart" when it's on, same reasoning as "folder"
+         * below — the common case (built-in icon) leaves the file uncluttered. */
+        if (g->use_boxart) {
+            fputs(",\n      \"use_boxart\": true", f);
+        }
+        /* Only emit "folder" when a custom path is set, so the common case
+         * (default install location) leaves the file uncluttered. */
+        if (g->folder[0]) {
+            fputs(",\n      \"folder\": ", f);
+            json_write_escaped(f, g->folder);
+        }
+        fputs(",\n      \"repos\": [\n", f);
+        for (int r = 0; r < g->repo_count; r++) {
+            const Repo *rp = &g->repos[r];
+            fputs("        { \"label\": ", f);
+            json_write_escaped(f, rp->label);
+            fputs(", \"a_id\": ", f);
+            json_write_escaped(f, rp->id);
+            fputs(", \"URL\": ", f);
+            json_write_escaped(f, rp->download_base);
+            fprintf(f, ", \"active\": %s, \"pinned\": %s }",
+                    rp->enabled ? "true" : "false",
+                    rp->pinned ? "true" : "false");
+            fputs(r + 1 < g->repo_count ? ",\n" : "\n", f);
+        }
+        fputs("      ]\n    }", f);
+        fputs(i + 1 < cfg->console_count ? ",\n" : "\n", f);
+    }
+    fputs("  ],\n  \"consoles\": [", f);
+    for (int i = 0; i < cfg->supported_count; i++) {
+        json_write_escaped(f, cfg->supported[i]);
+        if (i + 1 < cfg->supported_count) {
+            fputs(", ", f);
+        }
+    }
+    fputs("]\n}\n", f);
+    return commit_staged(f, SOURCES_TMP_PATH, SOURCES_PATH);
+}
+
+/* ---- credentials ------------------------------------------------------ */
+
+void creds_load(Credentials *c) {
+    memset(c, 0, sizeof(*c));
+    size_t len = 0;
+    char *js = json_read_file(CREDS_PATH, &len);
+    if (!js) {
+        return;
+    }
+    int ntok = 0;
+    jsmntok_t *tok = json_parse_alloc(js, len, &ntok);
+    if (tok && tok[0].type == JSMN_OBJECT) {
+        json_copy(js, tok, json_obj_get(js, tok, 0, "accessKey"), c->access_key,
+                  sizeof(c->access_key));
+        json_copy(js, tok, json_obj_get(js, tok, 0, "secret"), c->secret,
+                  sizeof(c->secret));
+        json_copy(js, tok, json_obj_get(js, tok, 0, "githubToken"),
+                  c->github_token, sizeof(c->github_token));
+        json_copy(js, tok, json_obj_get(js, tok, 0, "steamGridDbKey"),
+                  c->steamgriddb_key, sizeof(c->steamgriddb_key));
+    }
+    free(tok);
+    free(js);
+}
+
+bool creds_save(const Credentials *c) {
+    fs_mkdir_p(DATA_DIR);
+    /* Staged, and the return value is honest about the outcome. Opening
+     * CREDS_PATH "wb" directly truncated the file before the first byte was
+     * written, so a card that filled up mid-save destroyed the working key as
+     * well as failing to store the new one — and the unconditional `return
+     * true` then had the UI report success. These are keys the user copied off
+     * a website by hand; losing them silently is the worst thing this file can
+     * do. */
+    FILE *f = fopen(CREDS_TMP_PATH, "wb");
+    if (!f) {
+        return false;
+    }
+    fputs("{\n  \"accessKey\": ", f);
+    json_write_escaped(f, c->access_key);
+    fputs(",\n  \"secret\": ", f);
+    json_write_escaped(f, c->secret);
+    fputs(",\n  \"githubToken\": ", f);
+    json_write_escaped(f, c->github_token);
+    fputs(",\n  \"steamGridDbKey\": ", f);
+    json_write_escaped(f, c->steamgriddb_key);
+    fputs("\n}\n", f);
+    return commit_staged(f, CREDS_TMP_PATH, CREDS_PATH);
+}
+
+/* ---- preferences ------------------------------------------------------ */
+
+static void prefs_ext_seed_defaults(Prefs *p); /* defined below */
+
+void prefs_load(Prefs *p) {
+    p->use_cache = true;       /* defaults */
+    p->prevent_sleep = true;
+    p->group_consoles = true;
+    p->max_downloads = 3;
+    p->rate_all_kbps = 0;   /* unlimited */
+    p->rate_item_kbps = 0;  /* unlimited */
+    p->net_check = true;
+    p->chk_updates = true;
+    p->lang[0] = '\0';
+    strcpy(p->theme, "dark");
+    strcpy(p->accent, "signature");
+    p->card_view = true;
+    p->group_sets = true;
+    p->roms_override[0] = '\0';
+    p->custom_folders = false;
+    p->pinned_dir_count = 0;
+    p->filter_exts = true;
+    p->exclude_ext_count = 0;
+    p->skip_installed = true;
+    p->ex_bench = false;     /* benchmarking off by default */
+    p->ex_prealloc = true;   /* shipped behavior: preallocate output files */
+    p->ex_chunk_mb = 1;      /* shipped behavior: 1 MB write chunks */
+    p->inv_server = false;   /* companion inventory server off by default */
+    p->inv_code[0] = '\0';
+    p->keep_archives = false; /* extract downloaded archives by default */
+    p->convert_import = true; /* apply the post-import converter when present */
+    strcpy(p->region_order, "WUEJ"); /* World, USA, Europe, Japan */
+    p->mtp_enabled = true;   /* USB file transfer available by default */
+    p->show_header_version = false; /* header shows the wordmark only by default */
+    p->box_art_enabled = true; /* show cached covers in the list by default */
+    p->box_art_auto_fetch = true; /* auto-fetch art for new arrivals by default */
+    p->sd_full_access = false; /* whole-SD-card access off by default */
+    p->tour_done = false;    /* first-run guided tour hasn't shown yet */
+    prefs_ext_seed_defaults(p);
+    size_t len = 0;
+    char *js = json_read_file(PREFS_PATH, &len);
+    if (!js) {
+        return;
+    }
+    int ntok = 0;
+    jsmntok_t *tok = json_parse_alloc(js, len, &ntok);
+    if (tok && tok[0].type == JSMN_OBJECT) {
+        int idx = json_obj_get(js, tok, 0, "useCache");
+        if (idx >= 0) {
+            p->use_cache = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "preventSleep");
+        if (idx >= 0) {
+            p->prevent_sleep = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "groupConsoles");
+        if (idx >= 0) {
+            p->group_consoles = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "maxDownloads");
+        if (idx >= 0) {
+            int v = (int)json_u64(js, tok, idx);
+            if (v >= 1 && v <= 10) p->max_downloads = v;
+        }
+        idx = json_obj_get(js, tok, 0, "rateAllKbps");
+        if (idx >= 0) {
+            int v = (int)json_u64(js, tok, idx);
+            if (v >= 0) p->rate_all_kbps = v;
+        }
+        idx = json_obj_get(js, tok, 0, "rateItemKbps");
+        if (idx >= 0) {
+            int v = (int)json_u64(js, tok, idx);
+            if (v >= 0) p->rate_item_kbps = v;
+        }
+        idx = json_obj_get(js, tok, 0, "netCheck");
+        if (idx >= 0) {
+            p->net_check = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "chkUpdates");
+        if (idx >= 0) {
+            p->chk_updates = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "lang");
+        if (idx >= 0 && tok[idx].type == JSMN_STRING) {
+            json_copy(js, tok, idx, p->lang, sizeof(p->lang));
+        }
+        idx = json_obj_get(js, tok, 0, "theme");
+        if (idx >= 0 && tok[idx].type == JSMN_STRING) {
+            json_copy(js, tok, idx, p->theme, sizeof(p->theme));
+        }
+        idx = json_obj_get(js, tok, 0, "accent");
+        if (idx >= 0 && tok[idx].type == JSMN_STRING) {
+            json_copy(js, tok, idx, p->accent, sizeof(p->accent));
+        }
+        idx = json_obj_get(js, tok, 0, "cardView");
+        if (idx >= 0) {
+            p->card_view = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "groupSets");
+        if (idx >= 0) {
+            p->group_sets = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "romsOverride");
+        if (idx >= 0 && tok[idx].type == JSMN_STRING) {
+            json_copy(js, tok, idx, p->roms_override,
+                      sizeof(p->roms_override));
+        }
+        idx = json_obj_get(js, tok, 0, "customFolders");
+        if (idx >= 0) {
+            p->custom_folders = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "filterExts");
+        if (idx >= 0) {
+            p->filter_exts = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "skipInstalled");
+        if (idx >= 0) {
+            p->skip_installed = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "exBench");
+        if (idx >= 0) {
+            p->ex_bench = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "exPrealloc");
+        if (idx >= 0) {
+            p->ex_prealloc = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "exChunkMb");
+        if (idx >= 0) {
+            int v = (int)json_u64(js, tok, idx);
+            if (v == 1 || v == 2 || v == 4) p->ex_chunk_mb = v;
+        }
+        idx = json_obj_get(js, tok, 0, "invServer");
+        if (idx >= 0) {
+            p->inv_server = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "invCode");
+        if (idx >= 0 && tok[idx].type == JSMN_STRING) {
+            json_copy(js, tok, idx, p->inv_code, sizeof(p->inv_code));
+        }
+        idx = json_obj_get(js, tok, 0, "keepArchives");
+        if (idx >= 0) {
+            p->keep_archives = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "convertImport");
+        if (idx >= 0) {
+            p->convert_import = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "regionOrder");
+        if (idx >= 0 && tok[idx].type == JSMN_STRING) {
+            char v[8] = {0};
+            json_copy(js, tok, idx, v, sizeof(v));
+            /* Must be exactly the four letters, each once, or a corrupt/hand-
+             * edited value silently falls back to the shipped default rather
+             * than feeding onegr_score a ranking with a missing or doubled
+             * region. */
+            if (strlen(v) == 4 && strchr(v, 'W') && strchr(v, 'U') &&
+                strchr(v, 'E') && strchr(v, 'J')) {
+                strcpy(p->region_order, v);
+            }
+        }
+        idx = json_obj_get(js, tok, 0, "mtpEnabled");
+        if (idx >= 0) {
+            p->mtp_enabled = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "showHeaderVersion");
+        if (idx >= 0) {
+            p->show_header_version = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "boxArtEnabled");
+        if (idx >= 0) {
+            p->box_art_enabled = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "boxArtAutoFetch");
+        if (idx >= 0) {
+            p->box_art_auto_fetch = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "sdFullAccess");
+        if (idx >= 0) {
+            p->sd_full_access = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "tourDone");
+        if (idx >= 0) {
+            p->tour_done = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "excludeExts");
+        if (idx >= 0 && tok[idx].type == JSMN_ARRAY) {
+            /* A saved list replaces the seeded defaults wholesale (so a user who
+             * removed one keeps it gone). An absent key leaves defaults in. */
+            p->exclude_ext_count = 0;
+            int n = tok[idx].size;
+            int child = idx + 1;
+            for (int i = 0; i < n && p->exclude_ext_count < MAX_FILTER_EXTS; i++) {
+                if (tok[child].type == JSMN_OBJECT) {
+                    FilterExt *fe = &p->exclude_exts[p->exclude_ext_count];
+                    memset(fe, 0, sizeof(*fe));
+                    json_copy(js, tok, json_obj_get(js, tok, child, "ext"),
+                              fe->ext, sizeof(fe->ext));
+                    fe->enabled =
+                        json_bool(js, tok, json_obj_get(js, tok, child, "enabled"));
+                    if (fe->ext[0]) p->exclude_ext_count++;
+                }
+                child = json_tok_skip(tok, child);
+            }
+        }
+        idx = json_obj_get(js, tok, 0, "pinnedDirs");
+        if (idx >= 0 && tok[idx].type == JSMN_ARRAY) {
+            int n = tok[idx].size;
+            int child = idx + 1;
+            for (int i = 0; i < n && p->pinned_dir_count < MAX_PINNED_DIRS; i++) {
+                if (tok[child].type == JSMN_STRING) {
+                    json_copy(js, tok, child,
+                              p->pinned_dirs[p->pinned_dir_count],
+                              sizeof(p->pinned_dirs[0]));
+                    if (p->pinned_dirs[p->pinned_dir_count][0]) {
+                        p->pinned_dir_count++;
+                    }
+                }
+                child = json_tok_skip(tok, child);
+            }
+        }
+    }
+    free(tok);
+    free(js);
+}
+
+bool prefs_save(const Prefs *p) {
+    fs_mkdir_p(DATA_DIR);
+    /* Staged for the same reason as the other two: a failed in-place write left
+     * a truncated prefs.json, which parses as "no keys" and silently resets
+     * every setting — including the pinned dirs and extension filters the user
+     * built up by hand. */
+    FILE *f = fopen(PREFS_TMP_PATH, "wb");
+    if (!f) {
+        return false;
+    }
+    fprintf(f,
+            "{\n  \"useCache\": %s,\n  \"preventSleep\": %s,\n"
+            "  \"groupConsoles\": %s,\n  \"maxDownloads\": %d,\n"
+            "  \"rateAllKbps\": %d,\n  \"rateItemKbps\": %d,\n"
+            "  \"netCheck\": %s,\n  \"chkUpdates\": %s,\n"
+            "  \"lang\": ",
+            p->use_cache ? "true" : "false",
+            p->prevent_sleep ? "true" : "false",
+            p->group_consoles ? "true" : "false",
+            p->max_downloads,
+            p->rate_all_kbps,
+            p->rate_item_kbps,
+            p->net_check ? "true" : "false",
+            p->chk_updates ? "true" : "false");
+    json_write_escaped(f, p->lang);
+    fputs(",\n  \"theme\": ", f);
+    json_write_escaped(f, p->theme);
+    fputs(",\n  \"accent\": ", f);
+    json_write_escaped(f, p->accent);
+    fprintf(f, ",\n  \"cardView\": %s", p->card_view ? "true" : "false");
+    fprintf(f, ",\n  \"groupSets\": %s", p->group_sets ? "true" : "false");
+    fputs(",\n  \"romsOverride\": ", f);
+    json_write_escaped(f, p->roms_override);
+    fprintf(f, ",\n  \"customFolders\": %s",
+            p->custom_folders ? "true" : "false");
+    fputs(",\n  \"pinnedDirs\": [", f);
+    for (int i = 0; i < p->pinned_dir_count; i++) {
+        if (i) {
+            fputs(", ", f);
+        }
+        json_write_escaped(f, p->pinned_dirs[i]);
+    }
+    fprintf(f, "],\n  \"skipInstalled\": %s,\n  \"filterExts\": %s,\n"
+               "  \"exBench\": %s,\n  \"exPrealloc\": %s,\n  \"exChunkMb\": %d,\n"
+               "  \"invServer\": %s,\n  \"invCode\": ",
+            p->skip_installed ? "true" : "false",
+            p->filter_exts ? "true" : "false",
+            p->ex_bench ? "true" : "false",
+            p->ex_prealloc ? "true" : "false",
+            p->ex_chunk_mb,
+            p->inv_server ? "true" : "false");
+    json_write_escaped(f, p->inv_code);
+    fprintf(f, ",\n  \"keepArchives\": %s", p->keep_archives ? "true" : "false");
+    fprintf(f, ",\n  \"convertImport\": %s", p->convert_import ? "true" : "false");
+    fputs(",\n  \"regionOrder\": ", f);
+    json_write_escaped(f, p->region_order);
+    fprintf(f, ",\n  \"mtpEnabled\": %s", p->mtp_enabled ? "true" : "false");
+    fprintf(f, ",\n  \"showHeaderVersion\": %s",
+            p->show_header_version ? "true" : "false");
+    fprintf(f, ",\n  \"boxArtEnabled\": %s", p->box_art_enabled ? "true" : "false");
+    fprintf(f, ",\n  \"boxArtAutoFetch\": %s", p->box_art_auto_fetch ? "true" : "false");
+    fprintf(f, ",\n  \"sdFullAccess\": %s", p->sd_full_access ? "true" : "false");
+    fprintf(f, ",\n  \"tourDone\": %s", p->tour_done ? "true" : "false");
+    fputs(",\n  \"excludeExts\": [", f);
+    for (int i = 0; i < p->exclude_ext_count; i++) {
+        if (i) {
+            fputs(", ", f);
+        }
+        fputs("{ \"ext\": ", f);
+        json_write_escaped(f, p->exclude_exts[i].ext);
+        fprintf(f, ", \"enabled\": %s }",
+                p->exclude_exts[i].enabled ? "true" : "false");
+    }
+    fputs("]\n}\n", f);
+    return commit_staged(f, PREFS_TMP_PATH, PREFS_PATH);
+}
+
+bool prefs_dir_pinned(const Prefs *p, const char *name) {
+    for (int i = 0; i < p->pinned_dir_count; i++) {
+        if (strcasecmp(p->pinned_dirs[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void prefs_dir_pin_toggle(Prefs *p, const char *name) {
+    for (int i = 0; i < p->pinned_dir_count; i++) {
+        if (strcasecmp(p->pinned_dirs[i], name) == 0) {
+            /* unpin: shift the rest down */
+            for (int j = i; j < p->pinned_dir_count - 1; j++) {
+                memcpy(p->pinned_dirs[j], p->pinned_dirs[j + 1],
+                       sizeof(p->pinned_dirs[0]));
+            }
+            p->pinned_dir_count--;
+            return;
+        }
+    }
+    if (p->pinned_dir_count < MAX_PINNED_DIRS) {
+        snprintf(p->pinned_dirs[p->pinned_dir_count],
+                 sizeof(p->pinned_dirs[0]), "%s", name);
+        p->pinned_dir_count++;
+    }
+}
+
+/* ---- browse file-view extension filter -------------------------------- */
+
+/* Normalize a user-entered extension: drop leading dots/spaces and lowercase. */
+static void ext_normalize(const char *in, char *out, size_t osz) {
+    size_t o = 0;
+    if (osz) out[0] = '\0';
+    if (!in) return;
+    while (*in == '.' || *in == ' ' || *in == '\t') in++;
+    for (; *in && o + 1 < osz; in++) {
+        char c = *in;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        out[o++] = c;
+    }
+    out[o] = '\0';
+}
+
+/* True if `name` ends in ".<ext>" (case-insensitive). */
+static bool name_has_ext(const char *name, const char *ext) {
+    size_t nl = strlen(name), el = strlen(ext);
+    if (el == 0 || nl < el + 1 || name[nl - el - 1] != '.') return false;
+    return strcasecmp(name + nl - el, ext) == 0;
+}
+
+bool prefs_ext_add(Prefs *p, const char *ext) {
+    char norm[16];
+    ext_normalize(ext, norm, sizeof(norm));
+    if (!norm[0]) return false;
+    for (int i = 0; i < p->exclude_ext_count; i++) {
+        if (strcasecmp(p->exclude_exts[i].ext, norm) == 0) {
+            p->exclude_exts[i].enabled = true; /* re-enable an existing one */
+            return true;
+        }
+    }
+    if (p->exclude_ext_count >= MAX_FILTER_EXTS) return false;
+    FilterExt *fe = &p->exclude_exts[p->exclude_ext_count++];
+    sset(fe->ext, sizeof(fe->ext), norm);
+    fe->enabled = true;
+    return true;
+}
+
+bool prefs_ext_remove(Prefs *p, int idx) {
+    if (idx < 0 || idx >= p->exclude_ext_count) return false;
+    for (int i = idx; i < p->exclude_ext_count - 1; i++) {
+        p->exclude_exts[i] = p->exclude_exts[i + 1];
+    }
+    p->exclude_ext_count--;
+    return true;
+}
+
+bool prefs_ext_hidden(const Prefs *p, const char *filename) {
+    if (!p->filter_exts || !filename || !filename[0]) return false;
+    for (int i = 0; i < p->exclude_ext_count; i++) {
+        if (p->exclude_exts[i].enabled &&
+            name_has_ext(filename, p->exclude_exts[i].ext)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Default exclude list: metadata/sidecar files that are never wanted as ROMs. */
+static void prefs_ext_seed_defaults(Prefs *p) {
+    static const char *def[] = {"torrent", "xml", "sqlite",
+                                "out",     "txt", "jpg", "jpeg"};
+    for (size_t i = 0; i < sizeof(def) / sizeof(def[0]); i++) {
+        prefs_ext_add(p, def[i]);
+    }
+}
+
+void creds_auth_header(const Credentials *c, char *out, size_t out_sz) {
+    if (c->access_key[0] && c->secret[0]) {
+        snprintf(out, out_sz, "authorization: LOW %s:%s", c->access_key,
+                 c->secret);
+    } else {
+        out[0] = '\0';
+    }
+}
+
+/* ---- tico detection (legacy; result no longer drives behavior) -------- */
+
+static bool tico_is_installed(void) {
+    if (fs_exists("sdmc:/switch/tico.nro")) return true;
+    if (fs_exists("sdmc:/switch/tico/tico.nro")) return true;
+    if (fs_exists("sdmc:/tico")) return true;
+    return false;
+}
+
+/* Remove trailing slash(es) from a path. */
+static void trim_trailing_slash(char *p) {
+    size_t n = strlen(p);
+    while (n > 0 && (p[n - 1] == '/' || p[n - 1] == '\\')) {
+        p[--n] = '\0';
+    }
+}
+
+void tico_init(TicoState *ts) {
+    memset(ts, 0, sizeof(*ts));
+    ts->installed = tico_is_installed();
+    /* The app owns its ROM library at DEFAULT_ROMS_ROOT. A user override
+     * (Manage data -> ROM Download Folder) is applied afterward via
+     * tico_set_roms_override(); we no longer read any emulator's config. */
+    sset(ts->roms_path, sizeof(ts->roms_path), DEFAULT_ROMS_ROOT);
+}
+
+const char *roms_root(const TicoState *ts) {
+    return ts->roms_path;
+}
+
+void roms_normalize_path(const char *in, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!in) {
+        return;
+    }
+    /* Skip leading whitespace. */
+    while (*in == ' ' || *in == '\t') {
+        in++;
+    }
+    if (!*in) {
+        return; /* blank -> auto */
+    }
+    if (strncasecmp(in, "sdmc:", 5) == 0) {
+        sset(out, out_sz, in);
+    } else {
+        /* Strip leading slashes so we don't produce "sdmc://...". */
+        while (*in == '/' || *in == '\\') {
+            in++;
+        }
+        snprintf(out, out_sz, "sdmc:/%s", in);
+    }
+    trim_trailing_slash(out);
+}
+
+void tico_set_roms_override(TicoState *ts, const char *path) {
+    if (!path || !path[0]) {
+        return;
+    }
+    char norm[512];
+    roms_normalize_path(path, norm, sizeof(norm));
+    if (norm[0]) {
+        sset(ts->roms_path, sizeof(ts->roms_path), norm);
+    }
+}
